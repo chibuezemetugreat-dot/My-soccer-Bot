@@ -11,8 +11,8 @@ TELEGRAM_BOT_TOKEN = os.getenv("8680294291:AAE2kV7LIL_5ET3t6iz5wl8C1LKzBKrqpkM")
 TELEGRAM_CHAT_ID = os.getenv("8367160484")
 
 # Check threshold parameters
-DELTA_THRESHOLD = 5.0  # Alert if probability shifts by 5% or more
-CHECK_INTERVAL = 300   # Check every 5 minutes (300 seconds)
+DELTA_THRESHOLD = 2.0  # Alert if probability shifts by 5% or more
+CHECK_INTERVAL = 3600   # Check every 30 minutes (3600 seconds)
 
 # Store previous odds to detect shifts: {match_id: {selection: probability}}
 previous_state = {}
