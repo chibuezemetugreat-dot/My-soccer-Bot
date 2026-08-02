@@ -1,187 +1,155 @@
-import sqlite3
+import os
 import time
 import requests
+from datetime import datetime, timezone
 
-# ==========================================
-# 🔑 1. YOUR CREDENTIALS & CONFIGURATION
-# ==========================================
-TELEGRAM_BOT_TOKEN = "8680294291:AAE2kV7LIL_5ET3t6iz5wl8C1LKzBKrqpkM"
-TELEGRAM_CHAT_ID = "8367160484"
-ODDS_API_KEY = "ce18a6d60e07f56d00d8e3860db124d3"
+# ---------------------------------------------------------
+# CONFIGURATION & ENVIRONMENT VARIABLES
+# ---------------------------------------------------------
+API_KEY = os.getenv("ce18a6d60e07f56d00d8e3860db124d3")
+TELEGRAM_BOT_TOKEN = os.getenv("8680294291:AAE2kV7LIL_5ET3t6iz5wl8C1LKzBKrqpkM")
+TELEGRAM_CHAT_ID = os.getenv("8367160484")
 
-# Setting this to "upcoming" scans ALL active soccer leagues globally
-SPORT_KEY = "upcoming"
+# Check threshold parameters
+DELTA_THRESHOLD = 5.0  # Alert if probability shifts by 5% or more
+CHECK_INTERVAL = 300   # Check every 5 minutes (300 seconds)
 
-# THRESHOLD: Alert if any outcome's probability shifts by 2.0% or more
-DELTA_THRESHOLD = 2.0
-
-
-# ==========================================
-# 🗄️ 2. DATABASE INITIALIZATION
-# ==========================================
-def init_db():
-    conn = sqlite3.connect("odds_history.db")
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS odds_snapshots (
-            match_id TEXT PRIMARY KEY,
-            sport_title TEXT,
-            home_team TEXT,
-            away_team TEXT,
-            prob_h REAL,
-            prob_d REAL,
-            prob_a REAL,
-            margin REAL,
-            last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    conn.commit()
-    conn.close()
+# Store previous odds to detect shifts: {match_id: {selection: probability}}
+previous_state = {}
 
 
-# ==========================================
-# 📩 3. TELEGRAM SENDER
-# ==========================================
-def send_telegram_alert(message_text):
+def send_telegram_alert(message):
+    """Helper to send alerts directly to Telegram."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram environment variables not configured.")
+        return
+    
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
-        "text": message_text,
-        "parse_mode": "Markdown"
+        "text": message,
+        "parse_mode": "HTML"
     }
     try:
-        requests.post(url, json=payload)
+        requests.post(url, json=payload, timeout=10)
     except Exception as e:
-        print(f"Error sending Telegram alert: {e}")
+        print(f"Error sending Telegram message: {e}")
 
 
-# ==========================================
-# 📊 4. GLOBAL SCANNER & PROBABILITY SHIFT CALCULATOR
-# ==========================================
-def scan_and_detect_deltas():
-    print("🔍 Fetching live odds for global soccer matches...")
-
-    api_url = f"https://api.the-odds-api.com/v4/sports/{SPORT_KEY}/odds/"
-    params = {
-        "apiKey": ODDS_API_KEY,
-        "regions": "eu",
-        "markets": "h2h",
-        "oddsFormat": "decimal"
-    }
-
-    response = requests.get(api_url, params=params)
-    if response.status_code != 200:
-        print(f"API Error: {response.status_code}")
+def fetch_and_process_odds():
+    """Fetches odds, filters live/extreme games, and tracks sharp probability moves."""
+    global previous_state
+    
+    if not API_KEY:
+        print("ODDS_API_KEY environment variable is missing.")
         return
 
-    matches = response.json()
-    conn = sqlite3.connect("odds_history.db")
-    cursor = conn.cursor()
+    # Odds API Endpoint for Soccer Matches
+    url = f"https://api.the-odds-api.com/v4/sports/soccer/odds/?apiKey={API_KEY}&regions=eu,uk&markets=h2h"
+    
+    try:
+        response = requests.get(url, timeout=15)
+        if response.status_code != 200:
+            print(f"API Error ({response.status_code}): {response.text}")
+            return
+        
+        events = response.json()
+        now = datetime.now(timezone.utc)
 
-    for match in matches:
-        # FILTER: Only process soccer leagues
-        sport_name = match.get('sport_key', '')
-        if "soccer" not in sport_name:
-            continue
+        for event in events:
+            match_id = event.get('id')
+            home_team = event.get('home_team')
+            away_team = event.get('away_team')
+            league = event.get('sport_title', 'Soccer')
+            commence_time_str = event.get('commence_time')
 
-        league_title = match.get('sport_title', 'Soccer')
-        match_id = match.get('id')
-        home_team = match.get('home_team')
-        away_team = match.get('away_team')
-        bookmakers = match.get('bookmakers', [])
+            # ---------------------------------------------------------
+            # 🛑 FILTER 1: Skip Live / Finished Games (Pre-match only)
+            # ---------------------------------------------------------
+            if commence_time_str:
+                commence_time = datetime.fromisoformat(commence_time_str.replace('Z', '+00:00'))
+                if commence_time <= now:
+                    continue  # Game already started, skip!
 
-        if not bookmakers:
-            continue
+            # Grab bookmakers
+            bookmakers = event.get('bookmakers', [])
+            if not bookmakers:
+                continue
 
-        outcomes = bookmakers[0]['markets'][0]['outcomes']
-        odds_dict = {item['name']: item['price'] for item in outcomes}
+            # Get odds from the first available bookmaker (e.g., Pinnacle/365)
+            outcomes = bookmakers[0].get('markets', [{}])[0].get('outcomes', [])
+            if len(outcomes) < 3:
+                continue
 
-        h_odds = odds_dict.get(home_team)
-        a_odds = odds_dict.get(away_team)
-        d_odds = odds_dict.get('Draw')
+            # Extract prices (H2H)
+            odds_map = {out['name']: out['price'] for out in outcomes}
+            home_odds = odds_map.get(home_team)
+            away_odds = odds_map.get(away_team)
+            draw_odds = odds_map.get('Draw')
 
-        if not (h_odds and a_odds and d_odds):
-            continue
+            if not home_odds or not away_odds or not draw_odds:
+                continue
 
-        # 1. Calculate raw implied probabilities from decimal odds
-        raw_h, raw_d, raw_a = 1/h_odds, 1/d_odds, 1/a_odds
+            # ---------------------------------------------------------
+            # 🛑 FILTER 2: Skip Extreme / Dead Odds
+            # ---------------------------------------------------------
+            if home_odds > 15.0 or draw_odds > 15.0 or away_odds > 15.0:
+                continue
+            if home_odds < 1.10 or away_odds < 1.10:
+                continue
 
-        # 2. Calculate house overround margin
-        curr_margin = (raw_h + raw_d + raw_a) * 100
+            # Calculate raw margin and implied probabilities
+            raw_margin = (1/home_odds + 1/draw_odds + 1/away_odds) * 100
+            p_home = (1 / home_odds) / (raw_margin / 100) * 100
+            p_draw = (1 / draw_odds) / (raw_margin / 100) * 100
+            p_away = (1 / away_odds) / (raw_margin / 100) * 100
 
-        # 3. Scale implied probabilities to true 100% distribution
-        curr_prob_h = (raw_h / (curr_margin / 100)) * 100
-        curr_prob_d = (raw_d / (curr_margin / 100)) * 100
-        curr_prob_a = (raw_a / (curr_margin / 100)) * 100
+            # ---------------------------------------------------------
+            # SHIFT DETECTION & ALERT LOGIC
+            # ---------------------------------------------------------
+            if match_id in previous_state:
+                prev = previous_state[match_id]
+                delta_home = p_home - prev['home']
+                delta_draw = p_draw - prev['draw']
+                delta_away = p_away - prev['away']
 
-        # Check local database for historical baseline
-        cursor.execute("SELECT prob_h, prob_d, prob_a, margin FROM odds_snapshots WHERE match_id = ?", (match_id,))
-        previous_snapshot = cursor.fetchone()
+                # Trigger alert if any selection shifts beyond threshold
+                if abs(delta_home) >= DELTA_THRESHOLD or abs(delta_away) >= DELTA_THRESHOLD:
+                    msg = (
+                        f"⚡ <b>GLOBAL PROBABILITY SHIFT DETECTED</b>\n"
+                        f"🏆 League: {league}\n\n"
+                        f"⚽ Match: {home_team} vs {away_team}\n"
+                        f"📊 Margin: {prev['margin']:.1f}% ➔ {raw_margin:.1f}%\n\n"
+                        f"🏠 {home_team}:\n"
+                        f"  • Prob: {prev['home']:.1f}% ➔ {p_home:.1f}%\n"
+                        f"  • Delta: {delta_home:+.1f}% {'🟢' if delta_home > 0 else '🔴'}\n\n"
+                        f"🤝 Draw:\n"
+                        f"  • Prob: {prev['draw']:.1f}% ➔ {p_draw:.1f}%\n"
+                        f"  • Delta: {delta_draw:+.1f}% {'🟢' if delta_draw > 0 else '🔴'}\n\n"
+                        f"✈️ {away_team}:\n"
+                        f"  • Prob: {prev['away']:.1f}% ➔ {p_away:.1f}%\n"
+                        f"  • Delta: {delta_away:+.1f}% {'🟢' if delta_away > 0 else '🔴'}\n\n"
+                        f"🎯 New Odds: H {home_odds} | D {draw_odds} | A {away_odds}"
+                    )
+                    send_telegram_alert(msg)
 
-        if previous_snapshot is None:
-            # Match seen for the first time: Store initial baseline snapshot
-            cursor.execute('''
-                INSERT INTO odds_snapshots (match_id, sport_title, home_team, away_team, prob_h, prob_d, prob_a, margin)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (match_id, league_title, home_team, away_team, curr_prob_h, curr_prob_d, curr_prob_a, curr_margin))
-            conn.commit()
-            print(f"📌 Saved baseline [{league_title}]: {home_team} vs {away_team}")
-        else:
-            old_h, old_d, old_a, old_margin = previous_snapshot
+            # Update saved state
+            previous_state[match_id] = {
+                'home': p_home,
+                'draw': p_draw,
+                'away': p_away,
+                'margin': raw_margin
+            }
 
-            # Calculate Probability Deltas (Added or Deducted)
-            delta_h = curr_prob_h - old_h
-            delta_d = curr_prob_d - old_d
-            delta_a = curr_prob_a - old_a
-            delta_margin = curr_margin - old_margin
-
-            # Trigger condition: Did any probability or margin shift past threshold?
-            if abs(delta_h) >= DELTA_THRESHOLD or abs(delta_d) >= DELTA_THRESHOLD or abs(delta_a) >= DELTA_THRESHOLD:
-
-                # Format add (+) or deduct (-) delta strings
-                h_sign = f"+{delta_h:.1f}% 🟢" if delta_h > 0 else f"{delta_h:.1f}% 🔴"
-                d_sign = f"+{delta_d:.1f}% 🟢" if delta_d > 0 else f"{delta_d:.1f}% 🔴"
-                a_sign = f"+{delta_a:.1f}% 🟢" if delta_a > 0 else f"{delta_a:.1f}% 🔴"
-
-                alert_text = (
-                    f"⚡ *GLOBAL PROBABILITY SHIFT DETECTED*\n"
-                    f"🏆 *League:* `{league_title}`\n\n"
-                    f"⚽ *Match:* {home_team} vs {away_team}\n"
-                    f"📊 *Margin:* `{old_margin:.1f}%` ➔ `{curr_margin:.1f}%` ({delta_margin:+.1f}%)\n\n"
-                    f"🏠 *{home_team}:*\n"
-                    f"  • Prob: `{old_h:.1f}%` ➔ `{curr_prob_h:.1f}%`\n"
-                    f"  • Delta: `{h_sign}`\n\n"
-                    f"🤝 *Draw:*\n"
-                    f"  • Prob: `{old_d:.1f}%` ➔ `{curr_prob_d:.1f}%`\n"
-                    f"  • Delta: `{d_sign}`\n\n"
-                    f"✈️ *{away_team}:*\n"
-                    f"  • Prob: `{old_a:.1f}%` ➔ `{curr_prob_a:.1f}%`\n"
-                    f"  • Delta: `{a_sign}`\n\n"
-                    f"🎯 *New Odds:* H `{h_odds}` | D `{d_odds}` | A `{a_odds}`"
-                )
-
-                send_telegram_alert(alert_text)
-                print(f"🚨 SHIFT ALERT SENT [{league_title}]: {home_team} vs {away_team}")
-
-                # Update snapshot so future shifts are compared against this new value
-                cursor.execute('''
-                    UPDATE odds_snapshots
-                    SET prob_h = ?, prob_d = ?, prob_a = ?, margin = ?
-                    WHERE match_id = ?
-                ''', (curr_prob_h, curr_prob_d, curr_prob_a, curr_margin, match_id))
-                conn.commit()
-
-    conn.close()
+    except Exception as e:
+        print(f"Error fetching odds data: {e}")
 
 
-# ==========================================
-# ⏱️ 5. AUTOMATED LOOP (RUNS EVERY 30 MINUTES)
-# ==========================================
 if __name__ == "__main__":
-    init_db()
-    print("🚀 Global Soccer Shift Tracker Online!")
-    send_telegram_alert("🤖 *Shift Tracker Active:* Monitoring global soccer probability movements!")
-
+    print("Shift tracker active: monitoring global soccer probability movement (Pre-match mode)...")
+    send_telegram_alert("🚀 <b>Soccer Shift Tracker Active</b>\nMonitoring pre-match probability shifts.")
+    
     while True:
-        scan_and_detect_deltas()
-        time.sleep(1800)  # Waits 30 minutes between scans
+        fetch_and_process_odds()
+        time.sleep(CHECK_INTERVAL)
+        
