@@ -6,9 +6,9 @@ from datetime import datetime, timezone
 # ---------------------------------------------------------
 # CONFIGURATION & ENVIRONMENT VARIABLES
 # ---------------------------------------------------------
-API_KEY = os.getenv("ce18a6d60e07f56d00d8e3860db124d3")
-TELEGRAM_BOT_TOKEN = os.getenv("8680294291:AAE2kV7LIL_5ET3t6iz5wl8C1LKzBKrqpkM")
-TELEGRAM_CHAT_ID = os.getenv("8367160484")
+API_KEY = "ce18a6d60e07f56d00d8e3860db124d3"
+TELEGRAM_BOT_TOKEN = "8680294291:AAE2kV7LIL_5ET3t6iz5wl8C1LKzBKrqpkM"
+TELEGRAM_CHAT_ID = "8367160484"
 
 DELTA_THRESHOLD = 3.0  # Alert if Sharp Consensus probability shifts by 3% or more
 CHECK_INTERVAL = 300   # Check every 5 minutes (300 seconds)
