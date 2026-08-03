@@ -5,7 +5,7 @@ import requests
 import telebot
 
 TELEGRAM_BOT_TOKEN = "8968074202:AAHBTAt9-K1p-vgxB4SJbSdJEzUTRtoSMz0"
-TELEGRAM_CHAT_ID =  "8367160484"
+TELEGRAM_CHAT_ID = "8367160484"
 ODDS_API_KEY = "ce18a6d60e07f56d00d8e3860db124d3"
 
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
@@ -29,57 +29,70 @@ def devig(h, d, a):
 
 
 def fetch_multibookie_consensus(query_name):
-    """Searches live global bookies for the match and calculates Galton's Crowd Consensus."""
+    """Searches live global bookies across ALL active soccer leagues."""
     if not ODDS_API_KEY:
         return None
 
-    # Search upcoming soccer matches globally
-    url = f"https://api.the-odds-api.com/v4/sports/soccer/odds/?apiKey={ODDS_API_KEY}&regions=eu,uk,us&markets=h2h"
     try:
-        res = requests.get(url)
-        if res.status_code == 200:
-            matches = res.json()
-            query = query_name.lower()
+        # Step 1: Fetch all currently active soccer leagues/sports keys
+        sports_url = f"https://api.the-odds-api.com/v4/sports/?apiKey={ODDS_API_KEY}"
+        sports_res = requests.get(sports_url)
+        
+        if sports_res.status_code != 200:
+            return None
             
-            for m in matches:
-                home = m.get("home_team", "")
-                away = m.get("away_team", "")
-                full_fixture = f"{home} vs {away}".lower()
-                
-                # Check if match matches user input
-                if query in full_fixture or any(part in full_fixture for part in query.split()):
-                    bookmakers = m.get("bookmakers", [])
-                    if not bookmakers:
-                        continue
+        sports_data = sports_res.json()
+        soccer_keys = [s['key'] for s in sports_data if s.get('group') == 'Soccer' and s.get('active')]
 
-                    h_list, d_list, a_list = [], [], []
-                    for b in bookmakers:
-                        for market in b.get("markets", []):
-                            if market.get("key") == "h2h":
-                                for outcome in market.get("outcomes", []):
-                                    if outcome.get("name") == home:
-                                        h_list.append(outcome.get("price"))
-                                    elif outcome.get("name") == away:
-                                        a_list.append(outcome.get("price"))
-                                    else:
-                                        d_list.append(outcome.get("price"))
+        query = query_name.lower()
 
-                    if h_list and d_list and a_list:
-                        avg_h = sum(h_list) / len(h_list)
-                        avg_d = sum(d_list) / len(d_list)
-                        avg_a = sum(a_list) / len(a_list)
-                        
-                        margin, (ph, pd, pa), (divh, divd, diva) = devig(avg_h, avg_d, avg_a)
-                        
-                        return {
-                            "home": home,
-                            "away": away,
-                            "bookie_count": len(bookmakers),
-                            "avg_odds": (avg_h, avg_d, avg_a),
-                            "crowd_margin": margin,
-                            "crowd_prob": (ph, pd, pa),
-                            "crowd_div": (divh, divd, diva)
-                        }
+        # Step 2: Search active soccer leagues for the fixture
+        for sport_key in soccer_keys:
+            odds_url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds/?apiKey={ODDS_API_KEY}&regions=eu,uk,us&markets=h2h"
+            res = requests.get(odds_url)
+            
+            if res.status_code == 200:
+                matches = res.json()
+                for m in matches:
+                    home = m.get("home_team", "")
+                    away = m.get("away_team", "")
+                    full_fixture = f"{home} vs {away}".lower()
+                    
+                    # Fuzzy match check for team names
+                    if any(part in full_fixture for part in query.split() if len(part) > 2):
+                        bookmakers = m.get("bookmakers", [])
+                        if not bookmakers:
+                            continue
+
+                        h_list, d_list, a_list = [], [], []
+                        for b in bookmakers:
+                            for market in b.get("markets", []):
+                                if market.get("key") == "h2h":
+                                    for outcome in market.get("outcomes", []):
+                                        if outcome.get("name") == home:
+                                            h_list.append(outcome.get("price"))
+                                        elif outcome.get("name") == away:
+                                            a_list.append(outcome.get("price"))
+                                        else:
+                                            d_list.append(outcome.get("price"))
+
+                        if h_list and d_list and a_list:
+                            avg_h = sum(h_list) / len(h_list)
+                            avg_d = sum(d_list) / len(d_list)
+                            avg_a = sum(a_list) / len(a_list)
+                            
+                            margin, (ph, pd, pa), (divh, divd, diva) = devig(avg_h, avg_d, avg_a)
+                            
+                            return {
+                                "home": home,
+                                "away": away,
+                                "league": m.get("sport_title", sport_key),
+                                "bookie_count": len(bookmakers),
+                                "avg_odds": (avg_h, avg_d, avg_a),
+                                "crowd_margin": margin,
+                                "crowd_prob": (ph, pd, pa),
+                                "crowd_div": (divh, divd, diva)
+                            }
     except Exception as e:
         print(f"Error querying crowd consensus: {e}")
     return None
@@ -90,7 +103,7 @@ def fetch_multibookie_consensus(query_name):
 def handle_galton(message):
     """
     Format: /galton [OpenH] [OpenD] [OpenA] [CurrH] [CurrD] [CurrA] [Team A vs Team B]
-    Example: /galton 2.10 3.30 3.20 2.15 3.40 2.90 Limache vs Nublense
+    Example: /galton 2.80 2.75 2.80 2.55 2.75 3.30 Platense vs Talleres
     """
     try:
         raw_args = message.text.split()[1:]
@@ -100,7 +113,7 @@ def handle_galton(message):
                 "⚠️ <b>Usage Format:</b>\n"
                 "<code>/galton [OpenH] [OpenD] [OpenA] [CurrH] [CurrD] [CurrA] [Match Title]</code>\n\n"
                 "<i>Example:</i>\n"
-                "<code>/galton 2.10 3.30 3.20 2.15 3.40 2.90 Limache vs Nublense</code>",
+                "<code>/galton 2.80 2.75 2.80 2.55 2.75 3.30 Platense vs Talleres</code>",
                 parse_mode="HTML"
             )
             return
@@ -155,23 +168,24 @@ def handle_galton(message):
             c_h, c_d, c_a = crowd_data["crowd_prob"]
             div_h, div_d, div_a = crowd_data["crowd_div"]
             report += (
-                f"🌐 <b>GLOBAL CROWD CONSENSUS ({crowd_data['bookie_count']} Bookies)</b>\n"
+                f"🌐 <b>GLOBAL CROWD CONSENSUS ({crowd_data['league']})</b>\n"
+                f"• <b>Bookies Sampled:</b> {crowd_data['bookie_count']}\n"
                 f"• <b>Crowd Margin:</b> {crowd_data['crowd_margin']:.1f}%\n"
                 f"• <b>True Crowd Prob:</b> H {c_h:.1f}% | D {c_d:.1f}% | A {c_a:.1f}%\n"
-                f"• <b>True Fair Dividends:</b> H <b>{div_h:.2f}</b> | D <b>{div_a:.2f}</b> | A <b>{div_a:.2f}</b>\n"
+                f"• <b>True Fair Dividends:</b> H <b>{div_h:.2f}</b> | D <b>{div_d:.2f}</b> | A <b>{div_a:.2f}</b>\n"
             )
         else:
-            report += "🌐 <i>Global multi-bookie live consensus line not active for this fixture. Showing de-vigged input diagnostic.</i>"
+            report += "🌐 <i>Global multi-bookie consensus not active for this fixture. Showing de-vigged input diagnostic.</i>"
 
         bot.reply_to(message, report, parse_mode="HTML")
 
     except ValueError:
-        bot.reply_to(message, "❌ Check your odds inputs. Make sure numbers are valid (e.g. 2.10 3.30 3.20 2.15 3.40 2.90).")
+        bot.reply_to(message, "❌ Check your odds inputs. Make sure numbers are valid (e.g. 2.80 2.75 2.80 2.55 2.75 3.30).")
     except Exception as e:
         bot.reply_to(message, f"❌ Diagnostic error: {e}")
 
 
 # --- START TELEGRAM LISTENER ---
-print("Galton Wisdom Engine ready...")
+print("Galton Global Wisdom Engine ready...")
 bot.infinity_polling()
     
