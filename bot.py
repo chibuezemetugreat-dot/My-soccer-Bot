@@ -1,185 +1,170 @@
 import os
 import time
 import requests
-from datetime import datetime, timezone
+import telebot
 
-# ---------------------------------------------------------
-# CONFIGURATION & ENVIRONMENT VARIABLES
-# ---------------------------------------------------------
-API_KEY = "ce18a6d60e07f56d00d8e3860db124d3"
-TELEGRAM_BOT_TOKEN = "8680294291:AAE2kV7LIL_5ET3t6iz5wl8C1LKzBKrqpkM"
+# Grab secrets from environment variables
+TELEGRAM_BOT_TOKEN = "8968074202:AAHBTAt9-K1p-vgxB4SJbSdJEzUTRtoSMz0"
 TELEGRAM_CHAT_ID = "8367160484"
+ODDS_API_KEY = "ce18a6d60e07f56d00d8e3860db124d3"
 
-DELTA_THRESHOLD = 3.0  # Alert if Sharp Consensus probability shifts by 3% or more
-CHECK_INTERVAL = 300   # Check every 5 minutes (300 seconds)
+bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 
-# List of target Sharp Bookmakers/Exchanges
-SHARP_BOOKMAKERS = {'pinnacle', 'betfair_ex_uk', 'betonlineag', '1xbet', 'unibet_eu'}
-
-# Store previous state: {match_id: {selection: probability}}
-previous_state = {}
+# Store market state to track odds shifts over time
+market_cache = {}
 
 
-def send_telegram_alert(message):
-    """Helper to send alerts directly to Telegram."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram environment variables not configured.")
-        return
-    
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML"
-    }
+def calculate_devig(h, d, a):
+    """Calculates margin and de-vigged true fair probabilities."""
+    margin = (1 / h + 1 / d + 1 / a) * 100
+    p_h = (1 / h) / (margin / 100) * 100
+    p_d = (1 / d) / (margin / 100) * 100
+    p_a = (1 / a) / (margin / 100) * 100
+    return margin, p_h, p_d, p_a
+
+
+# --- COMMAND 1: MANUAL GALTON DIAGNOSTIC ---
+@bot.message_handler(commands=['galton'])
+def handle_galton(message):
+    """
+    Usage: /galton [OpenH] [OpenD] [OpenA] [CurrH] [CurrD] [CurrA]
+    Example: /galton 2.50 3.20 2.70 2.15 3.20 3.30
+    """
     try:
-        requests.post(url, json=payload, timeout=10)
-    except Exception as e:
-        print(f"Error sending Telegram message: {e}")
-
-
-def fetch_and_process_odds():
-    """Fetches odds, filters sharp books, calculates Galton consensus, and alerts on shift."""
-    global previous_state
-    
-    if not API_KEY:
-        print("ODDS_API_KEY environment variable is missing.")
-        return
-
-    # Odds API Endpoint for Soccer Matches
-    url = f"https://api.the-odds-api.com/v4/sports/soccer/odds/?apiKey={API_KEY}&regions=eu,uk,us&markets=h2h"
-    
-    try:
-        response = requests.get(url, timeout=15)
-        if response.status_code != 200:
-            print(f"API Error ({response.status_code}): {response.text}")
+        args = message.text.split()[1:]
+        if len(args) != 6:
+            bot.reply_to(
+                message,
+                "⚠️ <b>Usage Format:</b>\n<code>/galton [OpenH] [OpenD] [OpenA] [CurrH] [CurrD] [CurrA]</code>\n\n<i>Example:</i> <code>/galton 2.50 3.20 2.70 2.15 3.20 3.30</code>",
+                parse_mode="HTML"
+            )
             return
-        
-        events = response.json()
-        now = datetime.now(timezone.utc)
 
-        for event in events:
-            match_id = event.get('id')
-            home_team = event.get('home_team')
-            away_team = event.get('away_team')
-            league = event.get('sport_title', 'Soccer')
-            commence_time_str = event.get('commence_time')
+        h_o, d_o, a_o, h_c, d_c, a_c = map(float, args)
 
-            # 1. Skip Live / Finished Games (Pre-match only)
-            if commence_time_str:
-                commence_time = datetime.fromisoformat(commence_time_str.replace('Z', '+00:00'))
-                if commence_time <= now:
-                    continue  
+        margin_o, po_h, po_d, po_a = calculate_devig(h_o, d_o, a_o)
+        margin_c, pc_h, pc_d, pc_a = calculate_devig(h_c, d_c, a_c)
 
-            bookmakers = event.get('bookmakers', [])
-            if not bookmakers:
-                continue
+        dh = pc_h - po_h
+        dd = pc_d - po_d
+        da = pc_a - po_a
+        d_margin = margin_c - margin_o
 
-            # ---------------------------------------------------------
-            # 🏛️ GALTON CONSENSUS ENGINE (SHARP BOOKS ONLY)
-            # ---------------------------------------------------------
-            home_probs, draw_probs, away_probs = [], [], []
-            sharp_count = 0
+        report = (
+            f"📊 <b>ON-DEMAND GALTON DIAGNOSTIC</b>\n"
+            f"───────────────\n"
+            f"🏠 <b>Home:</b>\n"
+            f"  • Odds: {h_o:.2f} ➔ {h_c:.2f}\n"
+            f"  • True Prob: {po_h:.1f}% ➔ {pc_h:.1f}%\n"
+            f"  • Delta: {dh:+.1f}% {'🟢' if dh > 0 else '🔴'}\n\n"
+            f"🤝 <b>Draw:</b>\n"
+            f"  • Odds: {d_o:.2f} ➔ {d_c:.2f}\n"
+            f"  • True Prob: {po_d:.1f}% ➔ {pc_d:.1f}%\n"
+            f"  • Delta: {dd:+.1f}% {'🟢' if dd > 0 else '🔴'}\n\n"
+            f"✈️ <b>Away:</b>\n"
+            f"  • Odds: {a_o:.2f} ➔ {a_c:.2f}\n"
+            f"  • True Prob: {po_a:.1f}% ➔ {pc_a:.1f}%\n"
+            f"  • Delta: {da:+.1f}% {'🟢' if da > 0 else '🔴'}\n\n"
+            f"📈 <b>Margin:</b> {margin_o:.1f}% ➔ {margin_c:.1f}% ({d_margin:+.1f}%)\n"
+        )
+        bot.reply_to(message, report, parse_mode="HTML")
 
-            for bookmaker in bookmakers:
-                key = bookmaker.get('key', '').lower()
-                
-                # Filter for sharp books (fallback to all if no sharp book found)
-                if key in SHARP_BOOKMAKERS:
-                    markets = bookmaker.get('markets', [])
-                    if not markets:
-                        continue
-                    
-                    outcomes = markets[0].get('outcomes', [])
-                    if len(outcomes) < 3:
-                        continue
-
-                    odds_map = {out['name']: out['price'] for out in outcomes}
-                    h = odds_map.get(home_team)
-                    d = odds_map.get('Draw')
-                    a = odds_map.get(away_team)
-
-                    if h and d and a:
-                        # Skip extreme/dead odds outlier checks per book
-                        if h > 15.0 or d > 15.0 or a > 15.0 or h < 1.08 or a < 1.08:
-                            continue
-
-                        # Calculate individual book's raw margin
-                        margin = (1/h + 1/d + 1/a)
-                        
-                        # Strip margin (De-vig) to find true probability
-                        home_probs.append((1/h) / margin * 100)
-                        draw_probs.append((1/d) / margin * 100)
-                        away_probs.append((1/a) / margin * 100)
-                        sharp_count += 1
-
-            # Fallback: If no strict sharp bookmaker is found, average all available books
-            if not home_probs:
-                for bookmaker in bookmakers:
-                    markets = bookmaker.get('markets', [])
-                    if not markets: continue
-                    outcomes = markets[0].get('outcomes', [])
-                    if len(outcomes) < 3: continue
-                    odds_map = {out['name']: out['price'] for out in outcomes}
-                    h, d, a = odds_map.get(home_team), odds_map.get('Draw'), odds_map.get(away_team)
-                    if h and d and a and h < 15.0 and a < 15.0:
-                        margin = (1/h + 1/d + 1/a)
-                        home_probs.append((1/h) / margin * 100)
-                        draw_probs.append((1/d) / margin * 100)
-                        away_probs.append((1/a) / margin * 100)
-                        sharp_count += 1
-
-            if not home_probs:
-                continue
-
-            # Galton Consensus Averages (Mean across sharp sample)
-            p_home = sum(home_probs) / len(home_probs)
-            p_draw = sum(draw_probs) / len(draw_probs)
-            p_away = sum(away_probs) / len(away_probs)
-
-            # ---------------------------------------------------------
-            # SHIFT DETECTION & ALERT LOGIC
-            # ---------------------------------------------------------
-            if match_id in previous_state:
-                prev = previous_state[match_id]
-                delta_home = p_home - prev['home']
-                delta_draw = p_draw - prev['draw']
-                delta_away = p_away - prev['away']
-
-                if abs(delta_home) >= DELTA_THRESHOLD or abs(delta_away) >= DELTA_THRESHOLD:
-                    msg = (
-                        f"🧠 <b>GALTON SHARP CONSENSUS SHIFT</b>\n"
-                        f"🏆 League: {league}\n"
-                        f"🎯 Sharp Sample: {sharp_count} Bookmakers\n\n"
-                        f"⚽ Match: {home_team} vs {away_team}\n\n"
-                        f"🏠 {home_team}:\n"
-                        f"  • Prob: {prev['home']:.1f}% ➔ {p_home:.1f}%\n"
-                        f"  • Delta: {delta_home:+.1f}% {'🟢' if delta_home > 0 else '🔴'}\n\n"
-                        f"🤝 Draw:\n"
-                        f"  • Prob: {prev['draw']:.1f}% ➔ {p_draw:.1f}%\n"
-                        f"  • Delta: {delta_draw:+.1f}% {'🟢' if delta_draw > 0 else '🔴'}\n\n"
-                        f"✈️ {away_team}:\n"
-                        f"  • Prob: {prev['away']:.1f}% ➔ {p_away:.1f}%\n"
-                        f"  • Delta: {delta_away:+.1f}% {'🟢' if delta_away > 0 else '🔴'}"
-                    )
-                    send_telegram_alert(msg)
-
-            # Update saved consensus state
-            previous_state[match_id] = {
-                'home': p_home,
-                'draw': p_draw,
-                'away': p_away
-            }
-
+    except ValueError:
+        bot.reply_to(message, "❌ Invalid numbers provided. Space out your odds numbers correctly.")
     except Exception as e:
-        print(f"Error fetching odds data: {e}")
+        bot.reply_to(message, f"❌ Error executing calculation: {e}")
 
 
-if __name__ == "__main__":
-    print("Galton Sharp Engine active: monitoring sharp probability consensus...")
-    send_telegram_alert("🚀 <b>Galton Sharp Engine Active</b>\nMonitoring consensus sharp probability shifts.")
-    
-    while True:
-        fetch_and_process_odds()
-        time.sleep(CHECK_INTERVAL)
-            
+# --- AUTOMATED SHARP MARKET TRACKER (THE ODDS API) ---
+def fetch_live_odds():
+    """Fetches upcoming soccer odds across multiple sportsbooks from The Odds API."""
+    if not ODDS_API_KEY:
+        print("No ODDS_API_KEY environment variable provided.")
+        return
+
+    url = f"https://api.the-odds-api.com/v4/sports/soccer_epl/odds/?apiKey={ODDS_API_KEY}&regions=eu,uk&markets=h2h"
+    try:
+        res = requests.get(url)
+        if res.status_code == 200:
+            data = res.json()
+            for match in data:
+                match_id = match.get("id")
+                home_team = match.get("home_team")
+                away_team = match.get("away_team")
+
+                # Average odds across available bookmakers
+                bookmakers = match.get("bookmakers", [])
+                if not bookmakers:
+                    continue
+
+                h_odds, d_odds, a_odds = [], [], []
+                for b in bookmakers:
+                    for m in b.get("markets", []):
+                        if m.get("key") == "h2h":
+                            for outcome in m.get("outcomes", []):
+                                if outcome.get("name") == home_team:
+                                    h_odds.append(outcome.get("price"))
+                                elif outcome.get("name") == away_team:
+                                    a_odds.append(outcome.get("price"))
+                                else:
+                                    d_odds.append(outcome.get("price"))
+
+                if h_odds and d_odds and a_odds:
+                    avg_h = sum(h_odds) / len(h_odds)
+                    avg_d = sum(d_odds) / len(d_odds)
+                    avg_a = sum(a_odds) / len(a_odds)
+
+                    margin, p_h, p_d, p_a = calculate_devig(avg_h, avg_d, avg_a)
+
+                    # Check for probability shift vs cached baseline
+                    if match_id in market_cache:
+                        prev = market_cache[match_id]
+                        diff_h = p_h - prev['p_h']
+                        
+                        # Send alert if Home true probability shifts by >= 3%
+                        if abs(diff_h) >= 3.0:
+                            alert_text = (
+                                f"🚨 <b>SHARP MARKET SHIFT DETECTED</b>\n"
+                                f"⚽ <b>{home_team} vs {away_team}</b>\n"
+                                f"───────────────\n"
+                                f"🏠 <b>{home_team}:</b> {prev['p_h']:.1f}% ➔ {p_h:.1f}% ({diff_h:+.1f}%)\n"
+                                f"📊 Average Sharp Market Odds: {avg_h:.2f} | {avg_d:.2f} | {avg_a:.2f}"
+                            )
+                            bot.send_message(TELEGRAM_CHAT_ID, alert_text, parse_mode="HTML")
+
+                    # Update cache
+                    market_cache[match_id] = {'p_h': p_h, 'p_d': p_d, 'p_a': p_a}
+
+        else:
+            print(f"Odds API Error: {res.status_code}")
+    except Exception as e:
+        print(f"Fetch error: {e}")
+
+
+# Send startup message
+if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+    try:
+        bot.send_message(
+            TELEGRAM_CHAT_ID,
+            "🚀 <b>Galton Engine Online!</b>\n"
+            "• Watching Sharp Bookmakers for live shifts 24/7.\n"
+            "• Type <code>/galton [Odds]</code> anytime for manual diagnostics.",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        print(f"Startup message failed: {e}")
+
+# Start non-blocking polling so /galton commands respond instantly
+import threading
+
+def poll_telegram():
+    bot.infinity_polling()
+
+threading.Thread(target=poll_telegram, daemon=True).start()
+
+# Main loop for fetching Odds API data every 5 minutes
+print("Galton engine & Telegram listener running...")
+while True:
+    fetch_live_odds()
+    time.sleep(300)  # Wait 5 minutes between API checks
+        
